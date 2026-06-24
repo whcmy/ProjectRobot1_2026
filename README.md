@@ -1,196 +1,46 @@
-<p align="center">
-  <h1 align="center">🤖 ProjectRobot1 — Tinybit AI Smart Car</h1>
-  <p align="center">
-    <em>K210 Vision + micro:bit + Tinybit — an intelligent, programmable robot car</em>
-  </p>
-</p>
+# ProjectRobot1_2026
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Hardware-micro%3Abit%20%2B%20K210-blue?style=flat-square" alt="Hardware">
-  <img src="https://img.shields.io/badge/Language-MicroPython%20%2F%20MaixPy-orange?style=flat-square" alt="Language">
-  <img src="https://img.shields.io/badge/Library-tinybit-brightgreen?style=flat-square" alt="Library">
-  <img src="https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square" alt="License">
-</p>
+ProjectRobot1 is a micro:bit-based intelligent robot car controlled by a Python application running on a host PC. The system integrates multiple control modalities — keyboard teleoperation, directional navigation, speed profiling, and geometric path following — into a single, unified, menu-driven interface.
 
----
+The robot's intelligence is distributed across two processors:
 
-## 📖 Overview
+micro:bit v2 (Nordic nRF52833, 64 MHz ARM Cortex-M4) — Handles real-time motor PWM control, GPIO input/output, LED matrix display, and serial message parsing from the host PC.
 
-**ProjectRobot1** is a dual-processor intelligent robot car built on the **YahBoom Tinybit** platform. It combines:
+Sipeed Maix Bit (K210, 400 MHz RISC-V with 0.8 TOPS KPU) — AI coprocessor for camera capture (OV2640, 320×240 @ 30fps), neural network inference, and LCD display output.
 
-- 🧠 **K210 (MaixPy)** — AI vision coprocessor: real‑time camera input, neural‑network inference, object detection, face recognition, color tracking, and more
-- 🎮 **micro:bit (MicroPython)** — motion controller: receives vision results over UART, drives motors via `tinybit`, and handles user interaction through buttons & LED display
+Communication between the host PC and the robot uses a simple, robust text-based protocol over UART at 115200 baud. Commands from the PC to the robot are formatted as "$<2-char command code><variable-length payload>". For example, a movement command to set both motors to speed 150 would be "$20+L150+R150,#". The micro:bit parses this message and generates the corresponding PWM signals to the TB6612 motor driver.
 
-The two boards communicate over serial (115200 bps) using a simple text protocol: `$<cmd><payload>,#`
+![Architecture diagram — K210 + micro:bit](images/image1.png)
 
----
+What are the functions of these Python files?
 
-## 🧱 Architecture
+| # | File | Description |
+| --- | --- | --- |
+| — | robot_utils.py | Shared module: serial, motor control, PID, path planner, logger, safety guard |
+| 1 | robot_basic_move.py | Keyboard-driven forward/backward/turn/stop with speed levels 1-9 |
+| 2 | robot_direction_control.py | Angle-based (0-360°) and compass (N/NE/E/...) movement; 5 demos |
+| 3 | robot_speed_control.py | Speed profiles: ramp, trapezoidal, S-curve, sine wave, custom waypoints |
+| 4 | robot_path_control.py | 11 predefined paths: square, rectangle, triangle, circle, figure-8, zigzag, spiral, snake, lawn-mower, polygon, star + custom builder |
+| 5 | robot_color_tracking.py | PID-based colour object tracking with 2D PID, search mode, simulation |
+| 6 | robot_line_following.py | PID line following with junction detection, simulation + keyboard test |
+| 7 | robot_apriltag_navigation.py | AprilTag following, mission execution (tag sequence), virtual tag field |
+| 8 | robot_qrcode_commander.py | QR/barcode command parser (FWD, BACK, LEFT, RIGHT, SQUARE, CIRCLE, etc.) |
+| 9 | robot_face_recog_control.py | Face recognition with user DB, behaviour mapping (greet/follow/dance/stop) |
+| 10 | robot_object_detect_nav.py | VOC20 object→behaviour mapping + road sign detection |
+| 11 | robot_gesture_control.py | Face-position zone mapping to commands + keyboard gesture simulation |
+| 12 | robot_mnist_control.py | MNIST digit 0-9 → robot commands + autonomous mode |
+| 13 | robot_obstacle_avoidance.py | 5 strategies: simple, random, smart, wall-follow, cautious |
+| 14 | robot_voice_command.py | 40+ natural language commands with fuzzy matching |
+| 15 | robot_autonomous_explore.py | Occupancy grid mapping, 5 exploration strategies, curiosity-driven BFS |
+| 16 | robot_self_learning_nav.py | K210 self-learning (3 classes), trainable mappings, config save/load |
+| ★ | robot_complete.py | All 16 modes integrated in one unified menu-driven program |
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                     K210 (MaixPy)                        │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐     │
-│  │  Camera  │  │   KPU    │  │  Serial (ybserial)  │     │
-│  │  (OV2640)│──│ (AI/NPU) │──│  → UART TX →        │     │
-│  └──────────┘  └──────────┘  └────────────────────┘     │
-│       ↓                          │                       │
-│  sensor.snapshot()         $01… $04… $09… $20…          │
-│  AI inference              (protocol packets)            │
-└──────────────────────────────────────────────────────────┘
-                           │  UART (115200 bps)
-                           ↓
-┌──────────────────────────────────────────────────────────┐
-│                   micro:bit (MicroPython)                │
-│  ┌────────────────────┐  ┌──────────┐  ┌──────────┐     │
-│  │  Serial (UART RX)  │  │  tinybit  │  │  Motors  │     │
-│  │  ← parse protocol  │──│ .car_run()│──│  L + R   │     │
-│  └────────────────────┘  └──────────┘  └──────────┘     │
-│    Button A/B: pause / mode    LED display: status       │
-└──────────────────────────────────────────────────────────┘
-```
+How to configure the HEX file?
 
----
+Click here [Hex烧录参考手册（PDF）](./docs/Hex_Flashing_Guide.pdf) I have summarized all scenarios.
 
-## 🚀 Quick Start
+How to run the code?
 
-### 1. Flash the K210
+Open Mu Editor, click the flashing icon.
 
-Copy the desired program from [`source code/k210/`](source%20code/k210/) to the K210's SD card (usually `/sd/`). Make sure the corresponding `.kmodel` files are also present on the SD in the correct paths.
-
-### 2. Flash the micro:bit
-
-Open any `robot_*.py` file in [Mu Editor](https://codewith.mu/) and flash it to the micro:bit. All programs are standalone — pick the one that matches your K210 program.
-
-### 3. Power on
-
-1. Power the Tinybit car
-2. The K210 boots and starts vision processing
-3. The micro:bit starts receiving commands and driving motors
-4. Press **Button A** to pause/resume · **Button B** for status info
-
----
-
-## 📡 Serial Protocol
-
-| Code | Source (K210) | Payload | Description |
-|:---:|---|---|---|
-| `$01` | Color recognition | `<R\|G\|B\|Y>` | Detected color |
-| `$02` | Barcode scan | `<payload>` | Barcode text |
-| `$03` | QR code scan | `<payload>` | QR code text |
-| `$04` | AprilTag | `<id>,<family>` | Tag ID & family |
-| `$07` | Face mask detect | `<0\|1>` | 1 = with mask |
-| `$08` | Face recognition | `<Y\|N><index>` | Recognized identity |
-| `$09` | Object / AI sign | `<class_id>` | VOC20 object or road sign |
-| `$10` | Self-learning | `<1\|2\|3>` | Trained class |
-| `$11` | MNIST digit | `<0–9>` | Handwritten digit |
-| `$14` | Face detection | `<0\|1>` | 1 = face found |
-| **`$20`** | **Motor speed** | **`+LxxRxx`** | **Direct wheel speeds** |
-
-> Motor format: each speed is sign + 3 digits (e.g. `+080‑030` = left 80, right −30)
-
----
-
-## 📁 Repository Structure
-
-```
-ProjectRobot1_2026/
-│
-├── robot_basic_move.py          ← Button-controlled movement
-├── robot_speed_control.py       ← Speed calibration utility
-├── robot_direction_control.py   ← Compass / serial direction nav
-├── robot_path_control.py        ← Predefined geometric paths
-│
-├── robot_line_following.py      ← PID line tracking
-├── robot_color_tracking.py      ← Color-based object following
-├── robot_apriltag_navigation.py ← AprilTag marker guidance
-│
-├── robot_gesture_control.py     ← Face-position gesture interface
-├── robot_face_recog_control.py  ← Identity-based actions
-├── robot_mnist_control.py       ← Handwritten digit commands
-├── robot_object_detect_nav.py   ← VOC20 object-based navigation
-├── robot_qrcode_commander.py    ← QR / barcode command execution
-├── robot_self_learning_nav.py   ← Few-shot visual classifier nav
-│
-├── robot_obstacle_avoidance.py  ← Ultrasonic autonomous avoidance
-├── robot_voice_command.py       ← Serial text command interface
-├── robot_autonomous_explore.py  ← Curiosity-driven exploration
-│
-├── robot_complete.py            ← 🧩 Integrated all-in-one controller
-│
-└── source code/
-    ├── k210/                    ← K210 MaixPy vision programs (15 files)
-    │   ├── 2.1_color_recognition.py
-    │   ├── 2.2_3.2_find_barcodes.py
-    │   ├── 2.2_3.3_find_qrcodes.py
-    │   ├── 2.4_find_apriltags.py
-    │   ├── 2.5_3.4_voc20_object_detect.py
-    │   ├── 2.6_3.5_self_learning.py
-    │   ├── 2.7_3.6_face_mask_detect.py
-    │   ├── 2.8_face_recog.py
-    │   ├── 2.9_3.8_mnist.py
-    │   ├── 3.1_color_rgb.py
-    │   ├── 3.7_yolo_face_detect-Y.py
-    │   ├── 3.9_color_follow_line.py
-    │   ├── 3.10_follow_apriltag.py
-    │   ├── 3.11_follow_color.py
-    │   └── 3.12_tinybit_AI_sport.py
-    │
-    ├── KPU/                     ← K210 neural network models (.kmodel)
-    │   ├── face_detect_with_68landmark/
-    │   ├── face_mask_detect/
-    │   ├── face_recognization/
-    │   ├── mnist/
-    │   ├── self_learn_classifier/
-    │   ├── voc20_object_detect/
-    │   └── yolo_face_detect/
-    │
-    └── microbit/                ← Pre-compiled micro:bit hex files
-```
-
----
-
-## 🎮 Button Controls (micro:bit side)
-
-| Button | Function |
-|:---:|---|
-| **A** (tap) | Pause / Resume |
-| **B** (tap) | Show status / Cycle mode |
-| **A + B** | Emergency stop or execute action |
-| **Shake** | Emergency stop |
-
----
-
-## 🔧 Hardware
-
-| Component | Model |
-|---|---|
-| Main board | BBC micro:bit v2 |
-| Vision module | Sipeed M1/M1w (K210) |
-| Camera | OV2640 (200 W pixel) |
-| Car chassis | YahBoom Tinybit |
-| Motors | 2× N20 DC motor (TT motor) |
-| Sensors | Ultrasonic, IR line‑tracking, RGB LEDs |
-| Battery | 2× 18650 (7.4 V) |
-
----
-
-## 🧠 AI Capabilities (K210 KPU)
-
-| Model | Task | Classes |
-|---|---|---|
-| `yolo_face_detect` | Face detection | 1 (face) |
-| `face_detect_68landmark` | 68-point facial landmarks | — |
-| `feature_extraction` + `ld5` | Face recognition | User‑enrolled |
-| `detect_5` | Face mask detection | 2 (with / without) |
-| `voc20_detect` | Object detection | 20 (VOC classes) |
-| `uint8_mnist_cnn_model` | Handwritten digits | 10 (0–9) |
-| `mb-0.25` | Self‑learning classifier | 3 (user‑trained) |
-| `tinybit_AI_01` / `02` | Road sign recognition | 9–11 traffic signs |
-| `color_recognition` | Color detection | RGBY (threshold‑based) |
-
----
-
-## 📝 License
-
-MIT © 2026 — [whcmy](https://github.com/whcmy)
+![Mu Editor — flashing the micro:bit](images/image2.png)
