@@ -1,221 +1,148 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robot Direction Control — Multi-Direction Movement
-===================================================
-Implements precise directional movement control.
-The robot can move at any specified angle (0-360 degrees)
-and execute compound direction sequences.
+Robot Direction Control — Compass & Serial Direction Movement
+==============================================================
+Receives direction commands from K210 serial or uses
+micro:bit compass to navigate in 8 cardinal directions.
 
-Features:
-  - Move at arbitrary angles (0=forward, 90=right, 180=backward, 270=left)
-  - Compass-point navigation (N, NE, E, SE, S, SW, W, NW)
-  - Timed directional bursts
-  - Programmable direction sequences
-  - Real-time keyboard direction control
+Protocol (from K210): $05<direction>,#
+  direction = N / NE / E / SE / S / SW / W / NW / STOP
 
-Control mode:   Menu-driven + keyboard
-Target hardware: micro:bit + K210 smart car
-Communication:  Serial (UART)
+Also accepts: $20+LxxxRxxx,#  for direct motor control
+
+Hardware: micro:bit + Tinybit smart car
+Library:  tinybit
 """
 
-import sys
-import time
-import math
-from robot_utils import (RobotSerial, RobotMotion, SafetyGuard,
-                         print_banner, print_menu, wait_for_keypress)
+from microbit import display, Image, sleep, uart, compass
+import tinybit
 
+# --- Configuration ---
+BAUDRATE = 115200
+BASE_SPEED = 80
 
-class DirectionController:
-    """Precise directional movement controller."""
+# Compass heading → direction
+COMPASS_HEADINGS = {
+    (0, 22): "N", (23, 67): "NE", (68, 112): "E", (113, 157): "SE",
+    (158, 202): "S", (203, 247): "SW", (248, 292): "W", (293, 337): "NW",
+    (338, 360): "N",
+}
 
-    COMPASS = {
-        'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5,
-        'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
-        'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5,
-        'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5,
-    }
+# Direction → wheel speeds (L, R)
+DIRECTION_SPEEDS = {
+    "N":  (BASE_SPEED, BASE_SPEED),
+    "NE": (BASE_SPEED, BASE_SPEED // 2),
+    "E":  (BASE_SPEED, -BASE_SPEED),
+    "SE": (-BASE_SPEED // 2, -BASE_SPEED),
+    "S":  (-BASE_SPEED, -BASE_SPEED),
+    "SW": (-BASE_SPEED, -BASE_SPEED // 2),
+    "W":  (-BASE_SPEED, BASE_SPEED),
+    "NW": (BASE_SPEED // 2, BASE_SPEED),
+}
 
-    @staticmethod
-    def angle_to_wheel_speeds(angle, speed, max_speed=150):
-        angle = angle % 360
-        rad = math.radians(angle)
-        turn_factor = math.sin(rad)
-        fwd_factor = math.cos(rad)
-        s = abs(speed)
-        fwd = s * fwd_factor
-        if turn_factor >= 0:
-            left = fwd + s * turn_factor
-            right = fwd - s * turn_factor * 0.5
-        else:
-            right = fwd - s * turn_factor
-            left = fwd + s * turn_factor * 0.5
-        left = max(-max_speed, min(max_speed, int(left)))
-        right = max(-max_speed, min(max_speed, int(right)))
-        return left, right
+# Direction → display icon
+DIRECTION_ICONS = {
+    "N": Image.ARROW_N, "NE": Image.ARROW_NE, "E": Image.ARROW_E,
+    "SE": Image.ARROW_SE, "S": Image.ARROW_S, "SW": Image.ARROW_SW,
+    "W": Image.ARROW_W, "NW": Image.ARROW_NW,
+}
 
-    @staticmethod
-    def compass_to_angle(direction):
-        d = direction.upper()
-        if d in DirectionController.COMPASS:
-            return DirectionController.COMPASS[d]
-        return None
+# --- Initialize UART ---
+uart.init(baudrate=BAUDRATE)
 
+# --- Helper: parse $20 motor command ---
+def parse_motor(payload):
+    """Parse $20+LxxxRxxx,# → (left_speed, right_speed)"""
+    try:
+        payload = payload.strip().rstrip(',')
+        if len(payload) >= 8:
+            left_str = payload[0:4]   # e.g. "+050" or "-030"
+            right_str = payload[4:8]  # e.g. "+050" or "-030"
+            left = int(left_str)
+            right = int(right_str)
+            return left, right
+    except (ValueError, IndexError):
+        pass
+    return None
 
-class DirectionCommandHandler:
-    """Handles direction-based commands and executes movement."""
+# --- Helper: parse $05 direction command ---
+def parse_direction(payload):
+    """Parse $05<direction>,# → direction string"""
+    try:
+        direction = payload.strip().rstrip(',').upper()
+        if direction in DIRECTION_SPEEDS:
+            return direction
+    except Exception:
+        pass
+    return None
 
-    def __init__(self, motion):
-        self.motion = motion
-        self.dc = DirectionController()
-        self.default_speed = 100
-        self.default_duration = 1.0
+# --- Helper: read UART buffer ---
+def read_uart():
+    buf = ""
+    while uart.any():
+        b = uart.read(1)
+        if b:
+            ch = chr(b[0])
+            if ch == '$':
+                buf = '$'
+            elif buf.startswith('$'):
+                buf += ch
+                if ch == '#':
+                    return buf
+    return None
 
-    def move_angle(self, angle, speed=None, duration=None):
-        s = speed if speed is not None else self.default_speed
-        left, right = self.dc.angle_to_wheel_speeds(angle, s)
-        self.motion.set_wheel_speeds(left, right)
-        print(f"[DIR] angle={angle:6.1f}  ->  L={left:+4d}  R={right:+4d}")
-        if duration:
-            time.sleep(duration)
-            self.motion.stop()
+# --- Main loop ---
+display.show(Image.ARROW_N)
 
-    def move_compass(self, direction, speed=None, duration=None):
-        angle = self.dc.compass_to_angle(direction)
-        if angle is not None:
-            print(f"[DIR] {direction:>3s} ({angle:6.1f})", end='  ')
-            self.move_angle(angle, speed, duration)
-        else:
-            print(f"[ERROR] Unknown direction: {direction}")
+current_mode = "serial"  # "serial" or "compass"
 
-    def execute_sequence(self, sequence, loop=1):
-        for lap in range(loop):
-            print(f"\n--- Sequence lap {lap + 1}/{loop} ---")
-            for i, item in enumerate(sequence):
-                direction, speed, duration = item
-                print(f"  Step {i+1}: ", end='')
-                if isinstance(direction, str):
-                    self.move_compass(direction, speed, duration)
-                else:
-                    self.move_angle(direction, speed, duration)
-                time.sleep(0.1)
-            self.motion.stop()
-        print("\n[SEQ] Sequence complete.")
+while True:
+    # --- Toggle mode with button A ---
+    if button_a.was_pressed():
+        current_mode = "compass" if current_mode == "serial" else "serial"
 
+    # --- Mode: Serial control (receive from K210) ---
+    if current_mode == "serial":
+        cmd = read_uart()
+        if cmd:
+            if cmd.startswith("$20"):
+                speeds = parse_motor(cmd[3:])
+                if speeds:
+                    left, right = speeds
+                    tinybit.car_run(left, right)
+                    if left > 0 and right > 0:
+                        display.show(Image.ARROW_N)
+                    elif left < 0 and right < 0:
+                        display.show(Image.ARROW_S)
+                    elif left < 0:
+                        display.show(Image.ARROW_W)
+                    elif right < 0:
+                        display.show(Image.ARROW_E)
+                    else:
+                        display.show(Image.NO)
 
-def interactive_direction_mode(handler):
-    print("""
-  +--------------------------------------------------+
-  |     Interactive Direction Control Mode           |
-  +--------------------------------------------------+
-  |  Enter angle (0-360) or compass (N/NE/E/...)    |
-  |  Format:  <angle|compass> [speed] [duration]     |
-  |  Examples:  45          — move at 45 deg         |
-  |             NE 120 2    — NE, speed 120, 2 sec   |
-  |             stop        — stop the robot         |
-  |             quit        — exit this mode         |
-  +--------------------------------------------------+
-""")
-    while True:
-        try:
-            cmd = input("\nDirection> ").strip()
-            if not cmd:
-                continue
-            if cmd.lower() in ('quit', 'exit', 'q'):
-                break
-            if cmd.lower() == 'stop':
-                handler.motion.stop()
-                print("[STOP]")
-                continue
-            parts = cmd.split()
-            direction = parts[0]
-            speed = int(parts[1]) if len(parts) > 1 else None
-            duration = float(parts[2]) if len(parts) > 2 else None
-            try:
-                angle = float(direction)
-                handler.move_angle(angle, speed, duration)
-            except ValueError:
-                handler.move_compass(direction, speed, duration)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"[ERROR] {e}")
-    handler.motion.stop()
+            elif cmd.startswith("$05"):
+                direction = parse_direction(cmd[3:])
+                if direction:
+                    left, right = DIRECTION_SPEEDS[direction]
+                    tinybit.car_run(left, right)
+                    display.show(DIRECTION_ICONS.get(direction, Image.HAPPY))
 
+            elif cmd == "$#":
+                tinybit.car_run(0, 0)
+                display.show(Image.NO)
 
-def demo_compass_rose(handler, speed=100, step_time=0.8):
-    print_banner("Demo — Compass Rose")
-    for d in ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']:
-        handler.move_compass(d, speed, step_time)
-        time.sleep(0.3)
-    handler.motion.stop()
+    # --- Mode: Compass control (heading-based) ---
+    else:
+        heading = compass.heading()
+        if heading is not None:
+            direction = "N"
+            for (lo, hi), d in COMPASS_HEADINGS.items():
+                if lo <= heading <= hi:
+                    direction = d
+                    break
+            left, right = DIRECTION_SPEEDS[direction]
+            tinybit.car_run(left, right)
+            display.show(DIRECTION_ICONS.get(direction, Image.HAPPY))
 
-
-def demo_star_pattern(handler, speed=100):
-    print_banner("Demo — Star Pattern")
-    for i in range(5):
-        handler.move_angle(i * 72, speed, 1.5)
-        time.sleep(0.3)
-    handler.motion.stop()
-
-
-def demo_360_sweep(handler, speed=80):
-    print_banner("Demo — 360 Degree Sweep")
-    for angle in range(0, 360, 30):
-        handler.move_angle(angle, speed, 0.6)
-        time.sleep(0.2)
-    handler.motion.stop()
-
-
-def main():
-    print_banner("Robot Direction Control — Multi-Direction Movement")
-    robot_serial = RobotSerial()
-    if not robot_serial.is_connected():
-        print("[SIM] Running in simulation mode.\n")
-    motion = RobotMotion(robot_serial, min_speed=15, max_speed=200)
-    handler = DirectionCommandHandler(motion)
-    safety = SafetyGuard(motion, max_run_time=600)
-    safety.start()
-
-    menu_options = [
-        ('1', 'Interactive direction control (type angles/compass)'),
-        ('2', 'Demo — Compass Rose (8 directions)'),
-        ('3', 'Demo — Star Pattern (5-point)'),
-        ('4', 'Demo — 360 Degree Sweep'),
-        ('5', 'Demo — Square Path (90 deg turns)'),
-        ('q', 'Quit'),
-    ]
-
-    while True:
-        print_menu("Direction Control — Main Menu", menu_options)
-        choice = input("Select: ").strip().lower()
-        if choice == '1':
-            interactive_direction_mode(handler)
-        elif choice == '2':
-            demo_compass_rose(handler, speed=100, step_time=1.0)
-        elif choice == '3':
-            demo_star_pattern(handler, speed=100)
-        elif choice == '4':
-            demo_360_sweep(handler, speed=80)
-        elif choice == '5':
-            print_banner("Demo — Square Path")
-            for _ in range(4):
-                handler.move_angle(0, 120, 2.0)
-                time.sleep(0.2)
-                handler.move_angle(90, 100, 0.5)
-                time.sleep(0.2)
-            motion.stop()
-        elif choice == 'q':
-            break
-        else:
-            print("Invalid choice.")
-        wait_for_keypress()
-
-    motion.stop()
-    safety.stop()
-    robot_serial.disconnect()
-    print("[EXIT] Direction control ended.")
-
-
-if __name__ == "__main__":
-    main()
+    sleep(20)

@@ -1,171 +1,156 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Robot MNIST Control — Handwritten Digit Command Interface
 ===========================================================
-Uses handwritten digit recognition to control the robot.
-Show a digit to the camera and the robot executes the
-corresponding command.
+Receives MNIST digit recognition results from K210 and
+executes corresponding robot commands.
 
-Digit -> Command mapping:
-  0 — Stop          5 — Stop
-  1 — Forward Slow  6 — Turn Right
-  2 — Forward Med   7 — Backward
-  3 — Forward Fast  8 — Dance
-  4 — Turn Left     9 — Autonomous mode
+Works with K210 source: 2.9_3.8_mnist.py
 
-Target hardware: micro:bit + K210 smart car
-Communication:  Serial (UART)
+Protocol (from K210): $11<digit>,#
+  digit = 0-9
+
+Digit → Command mapping:
+  0 — Stop            5 — Stop
+  1 — Forward Slow    6 — Turn Right
+  2 — Forward Medium  7 — Backward
+  3 — Forward Fast    8 — Dance
+  4 — Turn Left       9 — Autonomous (PATROL)
+
+Hardware: micro:bit + Tinybit smart car
+Library:  tinybit
 """
 
-import sys
-import time
-from robot_utils import (RobotSerial, RobotMotion, SafetyGuard,
-                         print_banner, print_menu, wait_for_keypress)
+from microbit import display, Image, sleep, uart, button_a, button_b
+import tinybit
 
+# --- Configuration ---
+BAUDRATE = 115200
 
-class MNISTController:
-    """Controls the robot based on recognised handwritten digits."""
+# Digit → (action, speed, duration_ms)
+DIGIT_COMMANDS = {
+    0: ("stop", 0, 1000),
+    1: ("forward", 40, 1500),
+    2: ("forward", 80, 1500),
+    3: ("forward", 120, 1500),
+    4: ("turn_left", 60, 600),
+    5: ("stop", 0, 1000),
+    6: ("turn_right", 60, 600),
+    7: ("backward", 60, 1500),
+    8: ("dance", 80, 3000),
+    9: ("patrol", 80, 5000),
+}
 
-    DIGIT_COMMANDS = {
-        0: ('stop', 0, "Stop"),
-        1: ('forward', 40, "Forward — Slow"),
-        2: ('forward', 80, "Forward — Medium"),
-        3: ('forward', 120, "Forward — Fast"),
-        4: ('turn_left', 60, "Turn Left"),
-        5: ('stop', 0, "Stop"),
-        6: ('turn_right', 60, "Turn Right"),
-        7: ('backward', 60, "Backward"),
-        8: ('dance', 80, "Dance!"),
-        9: ('auto', 80, "Autonomous Mode"),
-    }
+# Digit → LED pattern
+DIGIT_IMAGES = {
+    0: Image("00900:09090:09090:09090:00900"),
+    1: Image("00900:09900:00900:00900:09990"),
+    2: Image("09990:00090:09990:09000:09990"),
+    3: Image("09990:00090:09990:00090:09990"),
+    4: Image("09090:09090:09990:00090:00090"),
+    5: Image("09990:09000:09990:00090:09990"),
+    6: Image("09990:09000:09990:09090:09990"),
+    7: Image("09990:00090:00090:00090:00090"),
+    8: Image("09990:09090:09990:09090:09990"),
+    9: Image("09990:09090:09990:00090:09990"),
+}
 
-    def __init__(self, motion):
-        self.motion = motion
-        self.last_digit = None
-        self.command_count = {}
-        self.autonomous_mode = False
+# --- Initialize UART ---
+uart.init(baudrate=BAUDRATE)
 
-    def execute_digit(self, digit):
-        if digit not in self.DIGIT_COMMANDS:
-            return
-        cmd, speed, description = self.DIGIT_COMMANDS[digit]
-        self.command_count[digit] = self.command_count.get(digit, 0) + 1
-        print(f"\n[DIGIT] {digit} -> {description}")
-
-        if cmd == 'stop':
-            self.motion.stop()
-        elif cmd == 'forward':
-            self.motion.forward(speed)
-            time.sleep(1.0)
-            self.motion.stop()
-        elif cmd == 'backward':
-            self.motion.backward(speed)
-            time.sleep(1.0)
-            self.motion.stop()
-        elif cmd == 'turn_left':
-            self.motion.turn_left(speed)
-            time.sleep(0.5)
-            self.motion.stop()
-        elif cmd == 'turn_right':
-            self.motion.turn_right(speed)
-            time.sleep(0.5)
-            self.motion.stop()
-        elif cmd == 'dance':
-            for _ in range(3):
-                self.motion.turn_left(80)
-                time.sleep(0.3)
-                self.motion.turn_right(80)
-                time.sleep(0.3)
-            self.motion.stop()
-        elif cmd == 'auto':
-            self.autonomous_mode = not self.autonomous_mode
-            status = "ON" if self.autonomous_mode else "OFF"
-            print(f"  Autonomous mode: {status}")
-
-    def show_stats(self):
-        if not self.command_count:
-            print("No digits recognised yet.")
-            return
-        print("\nDigit Recognition Stats:")
-        for d in range(10):
-            count = self.command_count.get(d, 0)
-            desc = self.DIGIT_COMMANDS[d][2]
-            bar = '#' * min(count, 30)
-            print(f"  {d}: {count:3d} {bar} -> {desc}")
-
-
-def run_simulation_demo(motion):
-    print_banner("Simulated MNIST Digit Control Demo")
-    controller = MNISTController(motion)
-    digits = [1, 2, 3, 4, 6, 7, 5, 8, 0]
-    for digit in digits:
-        controller.execute_digit(digit)
-        time.sleep(2.0)
-    motion.stop()
-    print("\n[DONE] MNIST control demo complete.")
-
-
-def run_interactive_mode(motion):
-    print_banner("Interactive MNIST Control")
-    print("Type a digit (0-9) to simulate handwritten digit recognition.")
-    print("  stats / quit\n")
-    controller = MNISTController(motion)
-    while True:
-        try:
-            cmd = input("Digit> ").strip()
-            if not cmd:
-                continue
-            if cmd.lower() in ('quit', 'exit', 'q'):
-                break
-            if cmd.lower() == 'stats':
-                controller.show_stats()
-                continue
-            digit = int(cmd)
-            if 0 <= digit <= 9:
-                controller.execute_digit(digit)
+# --- Helpers ---
+def read_command():
+    buf = ""
+    while uart.any():
+        b = uart.read(1)
+        if b is None:
+            continue
+        ch = chr(b[0])
+        if ch == '$':
+            buf = '$'
+        elif buf.startswith('$'):
+            if ch == '#':
+                inner = buf[1:]
+                if len(inner) >= 2:
+                    return inner[0:2], inner[2:]
+                return None, None
             else:
-                print("  Enter a digit 0-9.")
-        except (KeyboardInterrupt, EOFError):
-            break
-        except ValueError:
-            print("  Invalid input.")
-    motion.stop()
+                buf += ch
+    return None, None
 
+def execute_digit(digit):
+    """Execute robot action for a recognized digit."""
+    if digit not in DIGIT_COMMANDS:
+        return
 
-def main():
-    print_banner("Robot MNIST Control — Handwritten Digit Command Interface")
-    robot_serial = RobotSerial()
-    motion = RobotMotion(robot_serial, min_speed=15, max_speed=200)
-    safety = SafetyGuard(motion, max_run_time=300)
-    safety.start()
-    controller = MNISTController(motion)
+    action, speed, duration = DIGIT_COMMANDS[digit]
 
-    menu_options = [
-        ('1', 'Simulation demo (digit sequence)'),
-        ('2', 'Interactive mode (type digits)'),
-        ('3', 'Show digit statistics'),
-        ('q', 'Quit'),
-    ]
-    while True:
-        print_menu("MNIST Control — Main Menu", menu_options)
-        choice = input("Select: ").strip().lower()
-        if choice == '1':
-            run_simulation_demo(motion)
-        elif choice == '2':
-            run_interactive_mode(motion)
-        elif choice == '3':
-            controller.show_stats()
-        elif choice == 'q':
-            break
+    # Show digit on LED
+    if digit in DIGIT_IMAGES:
+        display.show(DIGIT_IMAGES[digit])
+
+    # Execute action
+    if action == "stop":
+        tinybit.car_run(0, 0)
+    elif action == "forward":
+        tinybit.car_run(speed, speed)
+    elif action == "backward":
+        tinybit.car_run(-speed, -speed)
+    elif action == "turn_left":
+        tinybit.car_run(-speed, speed)
+    elif action == "turn_right":
+        tinybit.car_run(speed, -speed)
+    elif action == "dance":
+        # Wiggle dance
+        for _ in range(3):
+            tinybit.car_run(-speed, speed)
+            sleep(300)
+            tinybit.car_run(speed, -speed)
+            sleep(300)
+        tinybit.car_run(0, 0)
+    elif action == "patrol":
+        # Autonomous patrol: forward + occasional turns
+        for _ in range(3):
+            tinybit.car_run(speed, speed)
+            sleep(1000)
+            tinybit.car_run(speed, -speed)
+            sleep(350)
+        tinybit.car_run(0, 0)
+
+    # Hold for duration then stop
+    sleep(duration)
+    tinybit.car_run(0, 0)
+
+# --- Main loop ---
+display.show(Image.HAPPY)
+last_digit = None
+running = True
+
+while True:
+    if button_a.was_pressed():
+        running = not running
+        if not running:
+            tinybit.car_run(0, 0)
+            display.show(Image.NO)
         else:
-            print("Invalid choice.")
-        wait_for_keypress()
+            display.show(Image.HAPPY)
 
-    safety.stop()
-    robot_serial.disconnect()
-    print("[EXIT] MNIST control ended.")
+    if button_b.was_pressed() and last_digit is not None:
+        display.scroll(str(last_digit))
 
+    if not running:
+        sleep(50)
+        continue
 
-if __name__ == "__main__":
-    main()
+    cmd, payload = read_command()
+
+    if cmd == "11":
+        try:
+            digit = int(payload.strip().rstrip(','))
+            if 0 <= digit <= 9:
+                last_digit = digit
+                execute_digit(digit)
+        except ValueError:
+            pass
+
+    sleep(20)

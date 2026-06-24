@@ -1,127 +1,124 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robot Color Tracking — Vision-Guided Object Following
-======================================================
-Implements colour-based object detection and tracking.
-The robot uses the K210 camera to detect a coloured
-target and follows it using PID-controlled movement.
+Robot Color Tracking — Follow Colored Objects
+===============================================
+Receives color detection data from K210 via serial and
+follows the detected color target.
 
-Features:
-  - Real-time colour target tracking with PID
-  - Target search mode (rotate until found)
-  - Lost-target behaviour
-  - Adjustable PID gains
-  - Simulation mode for testing without hardware
+Works with K210 source: 3.1_color_rgb.py or 3.11_follow_color.py
 
-Target hardware: micro:bit + K210 smart car
-Communication:  Serial (UART)
+Protocol (from K210):
+  $01<R/G/B/Y>,#           — Color detected (RGB LED feedback)
+  $20+LxxxRxxx,#            — Motor speed command (from follow_color K210)
+
+Behavior:
+  - R (Red)    → LED: show red pattern, follow
+  - G (Green)  → LED: show green pattern, follow
+  - B (Blue)   → LED: show blue pattern, follow
+  - Y (Yellow) → LED: show yellow pattern, follow
+  - No color   → stop
+
+Hardware: micro:bit + Tinybit smart car
+Library:  tinybit
 """
 
-import sys
-import time
-import math
-from robot_utils import (RobotSerial, RobotMotion, PIDController2D,
-                         SafetyGuard, print_banner, print_menu,
-                         wait_for_keypress)
+from microbit import display, Image, sleep, uart, button_a
+import tinybit
 
+# --- Configuration ---
+BAUDRATE = 115200
 
-class ColorTracker:
-    """PID-based colour target tracker."""
+# --- Custom LED images for each color ---
+IMG_RED = Image("00000:00000:00900:00000:00000")
+IMG_GREEN = Image("00000:00000:09000:00000:00000")
+IMG_BLUE = Image("00000:00000:90000:00000:00000")
+IMG_YELLOW = Image("09090:90009:00000:90009:09090")
 
-    IMG_W = 320
-    IMG_H = 240
-    TARGET_X = IMG_W // 2
-    TARGET_Y = IMG_H // 2
+COLOR_ICONS = {
+    "R": IMG_RED,
+    "G": IMG_GREEN,
+    "B": IMG_BLUE,
+    "Y": IMG_YELLOW,
+}
 
-    def __init__(self, robot_serial, motion):
-        self.serial = robot_serial
-        self.motion = motion
-        self.pid = PIDController2D(
-            target_x=self.TARGET_X, target_y=self.TARGET_Y,
-            Px=5, Ix=0, Dx=1, Py=20, Iy=1, Dy=3, scale=100.0
-        )
-        self.target_found = False
-        self.target_x = 0
-        self.target_y = 0
-        self.lost_frames = 0
-        self.base_speed = 40
-        self.max_speed = 150
-        self.dead_zone = 15
+# --- Initialize UART ---
+uart.init(baudrate=BAUDRATE)
 
-    def compute_motor_speeds(self, x, y, w, h):
-        dx = x - self.TARGET_X
-        dy = y - self.TARGET_Y
-        if abs(dx) < self.dead_zone and abs(dy) < self.dead_zone:
-            return 0, 0
-        out_x, out_y = self.pid.compute(x, y, limit_x=80, limit_y=60)
-        left = int(self.base_speed + out_y + out_x)
-        right = int(self.base_speed + out_y - out_x)
-        left = max(-self.max_speed, min(self.max_speed, left))
-        right = max(-self.max_speed, min(self.max_speed, right))
-        return left, right
-
-    def stop(self):
-        self.motion.stop()
-
-
-def run_simulation_demo(motion, duration=20):
-    """Run colour tracking with a simulated target moving in a circle."""
-    print_banner("Simulated Colour Tracking Demo")
-    print("A virtual target moves in a circle — watch the PID controller track it.\n")
-    pid = PIDController2D(160, 120, 5, 0, 1, 20, 1, 3, 100.0)
-    base_speed = 40
-    sim_time = 0.0
-    start_time = time.time()
+# --- Helpers ---
+def parse_motor(payload):
+    """Parse $20+LxxxRxxx,# → (left, right) or None."""
     try:
-        while time.time() - start_time < duration:
-            sim_time += 0.05
-            tx = 160 + int(80 * math.sin(sim_time * 0.5))
-            ty = 120 + int(60 * math.cos(sim_time * 0.5))
-            ox, oy = pid.compute(tx, ty, 80, 60)
-            left = int(base_speed + oy + ox)
-            right = int(base_speed + oy - ox)
-            left = max(-150, min(150, left))
-            right = max(-150, min(150, right))
-            motion.set_wheel_speeds(left, right)
-            print(f"\r  Target:({tx:3d},{ty:3d}) PID:({ox:+5.1f},{oy:+5.1f}) "
-                  f"Motors:L={left:+4d} R={right:+4d}  ", end='', flush=True)
-            time.sleep(0.05)
-    except KeyboardInterrupt:
+        payload = payload.strip().rstrip(',')
+        if len(payload) >= 8:
+            return int(payload[0:4]), int(payload[4:8])
+    except (ValueError, IndexError):
         pass
-    finally:
-        motion.stop()
-        print("\n[STOP] Simulation ended.")
+    return None
 
+def parse_color(payload):
+    """Parse $01<color>,# → color char or None."""
+    try:
+        c = payload.strip().rstrip(',').upper()
+        if c in ("R", "G", "B", "Y"):
+            return c
+    except Exception:
+        pass
+    return None
 
-def main():
-    print_banner("Robot Color Tracking — Vision-Guided Object Following")
-    robot_serial = RobotSerial()
-    motion = RobotMotion(robot_serial, min_speed=15, max_speed=200)
-    safety = SafetyGuard(motion, max_run_time=300)
-    safety.start()
+def read_command():
+    """Read one complete $... # packet from UART."""
+    buf = ""
+    while uart.any():
+        b = uart.read(1)
+        if b is None:
+            continue
+        ch = chr(b[0])
+        if ch == '$':
+            buf = '$'
+        elif buf.startswith('$'):
+            if ch == '#':
+                inner = buf[1:]
+                if len(inner) >= 2:
+                    return inner[0:2], inner[2:]
+                return None, None
+            else:
+                buf += ch
+    return None, None
 
-    if robot_serial.is_connected():
-        tracker = ColorTracker(robot_serial, motion)
-        print("\n[READY] Colour tracking active.")
-        print("  Place a coloured object in front of the K210 camera.")
-        print("  Press Ctrl+C to stop.\n")
-        try:
-            while True:
-                data = robot_serial.read_line()
-                time.sleep(0.02)
-        except KeyboardInterrupt:
-            print("\n[INTERRUPT]")
-        finally:
-            tracker.stop()
-    else:
-        print("[SIM] No robot detected — running simulation demo.\n")
-        run_simulation_demo(motion, duration=20)
+# --- Main loop ---
+display.show(Image.HAPPY)
 
-    safety.stop()
-    robot_serial.disconnect()
-    print("[EXIT] Colour tracking ended.")
+current_color = None
+running = True
 
+while True:
+    # Button A: toggle pause
+    if button_a.was_pressed():
+        running = not running
+        if not running:
+            tinybit.car_run(0, 0)
+            display.show(Image.NO)
 
-if __name__ == "__main__":
-    main()
+    if not running:
+        sleep(50)
+        continue
+
+    cmd, payload = read_command()
+
+    if cmd == "20":
+        # Motor speed command (from color-following K210)
+        speeds = parse_motor(payload)
+        if speeds:
+            tinybit.car_run(speeds[0], speeds[1])
+
+    elif cmd == "01":
+        # Color detected — show on LED
+        color = parse_color(payload)
+        if color and color != current_color:
+            current_color = color
+            display.show(COLOR_ICONS.get(color, Image.HAPPY))
+
+    elif cmd is not None and cmd != "01" and cmd != "20":
+        pass  # ignore other commands
+
+    sleep(10)
