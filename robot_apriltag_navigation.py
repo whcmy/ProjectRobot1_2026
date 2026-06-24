@@ -1,128 +1,129 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robot AprilTag Navigation — Fiducial Marker-Based Guidance
-===========================================================
-Implements navigation using AprilTag visual fiducial markers.
-The robot can:
-  - Follow a specific tag (visual servoing via PID)
-  - Navigate toward a tag with a specific ID
-  - Execute tag-based missions (go to tag 1, then tag 2, ...)
+Robot AprilTag Navigation — Fiducial Marker Following
+=======================================================
+Receives AprilTag detection data from K210 and navigates
+toward / follows detected AprilTag markers.
 
-Target hardware: micro:bit + K210 smart car
-Communication:  Serial (UART)
+Works with K210 source: 2.4_find_apriltags.py or 3.10_follow_apriltag.py
+
+Protocol (from K210):
+  $04<id>,<family>,#  — AprilTag detected (ID + family name)
+  $20+LxxxRxxx,#       — Motor speed command (from follow_apriltag K210)
+
+When using 3.10_follow_apriltag.py (PID follow mode),
+the K210 computes PID and sends $20 motor commands directly.
+When using 2.4_find_apriltags.py (detection mode),
+the micro:bit shows tag info on LED and waits for motor commands.
+
+Hardware: micro:bit + Tinybit smart car
+Library:  tinybit
 """
 
-import sys
-import time
-import math
-from robot_utils import (RobotSerial, RobotMotion, PIDController2D,
-                         SafetyGuard, print_banner, print_menu,
-                         wait_for_keypress)
+from microbit import display, Image, sleep, uart, button_a, button_b
+import tinybit
 
+# --- Configuration ---
+BAUDRATE = 115200
 
-class AprilTagNavigator:
-    """Navigates using AprilTag markers detected by the K210 camera."""
+# --- Initialize UART ---
+uart.init(baudrate=BAUDRATE)
 
-    IMG_W = 160
-    IMG_H = 120
-    TARGET_X = IMG_W // 2
-    TARGET_Y = IMG_H // 2
+# --- Helpers ---
+def parse_motor(payload):
+    """Parse $20+LxxxRxxx,# → (left, right) or None."""
+    try:
+        payload = payload.strip().rstrip(',')
+        if len(payload) >= 8:
+            return int(payload[0:4]), int(payload[4:8])
+    except (ValueError, IndexError):
+        pass
+    return None
 
-    def __init__(self, robot_serial, motion):
-        self.serial = robot_serial
-        self.motion = motion
-        self.pid = PIDController2D(
-            target_x=self.TARGET_X, target_y=self.TARGET_Y,
-            Px=5, Ix=0, Dx=1, Py=20, Iy=1, Dy=3, scale=100.0
-        )
-        self.current_tag_id = None
-        self.tag_found = False
-        self.base_speed = 30
+def parse_apriltag(payload):
+    """Parse $04<id>,<family>,# → (tag_id, family) or None."""
+    try:
+        payload = payload.strip().rstrip(',')
+        parts = payload.split(',')
+        if len(parts) >= 2:
+            return parts[0].strip(), parts[1].strip()
+    except Exception:
+        pass
+    return None
 
-    def parse_tag_data(self, data):
-        try:
-            data = data.strip()
-            if '$04' in data:
-                start = data.find('$04') + 3
-                end = data.find(',#')
-                if end == -1:
-                    end = len(data)
-                payload = data[start:end]
-                parts = payload.split(',')
-                if len(parts) >= 2:
-                    return parts[0].strip(), parts[1].strip()
-        except (ValueError, IndexError):
-            pass
-        return None
+def read_command():
+    """Read one complete $... # packet from UART."""
+    buf = ""
+    while uart.any():
+        b = uart.read(1)
+        if b is None:
+            continue
+        ch = chr(b[0])
+        if ch == '$':
+            buf = '$'
+        elif buf.startswith('$'):
+            if ch == '#':
+                inner = buf[1:]
+                if len(inner) >= 2:
+                    return inner[0:2], inner[2:]
+                return None, None
+            else:
+                buf += ch
+    return None, None
 
-    def execute_mission(self, tag_sequence, dwell_time=2.0):
-        print_banner("AprilTag Mission")
-        print(f"Mission: visit tags {tag_sequence}")
-        for i, tag_id in enumerate(tag_sequence):
-            print(f"\n--- Navigating to Tag {tag_id} ({i+1}/{len(tag_sequence)}) ---")
-            for _ in range(5):
-                self.motion.forward(50)
-                time.sleep(0.3)
-            self.motion.stop()
-            print(f"  [ARRIVED] At Tag {tag_id}")
-            time.sleep(dwell_time)
-        self.motion.stop()
-        print("\n[MISSION COMPLETE]")
+# --- Main loop ---
+display.show(Image.TARGET)  # target icon placeholder
 
+running = True
+last_tag_id = None
 
-def run_simulation_demo(motion, duration=20):
-    print_banner("Simulated AprilTag Navigation Demo")
-    print("Virtual tags placed in a 160x120 arena.\n")
-    navigator = AprilTagNavigator(None, motion)
-    mission_tags = ['0', '1', '2']
-    for tag_id in mission_tags:
-        print(f"\n--- Navigating to Tag {tag_id} ---")
-        for step in range(10):
-            print(f"\r  Approaching... step {step+1}/10", end='', flush=True)
-            motion.forward(40)
-            time.sleep(0.3)
-        motion.stop()
-        print(f"\n  [ARRIVED] At Tag {tag_id}")
-        time.sleep(1.0)
-    motion.stop()
-    print("\n[DONE] Mission complete.")
-
-
-def main():
-    print_banner("Robot AprilTag Navigation — Fiducial Marker Guidance")
-    robot_serial = RobotSerial()
-    motion = RobotMotion(robot_serial, min_speed=15, max_speed=200)
-    safety = SafetyGuard(motion, max_run_time=300)
-    safety.start()
-
-    navigator = AprilTagNavigator(robot_serial, motion)
-
-    menu_options = [
-        ('1', 'Simulation demo'),
-        ('2', 'Execute mission (tag sequence)'),
-        ('q', 'Quit'),
-    ]
-
-    while True:
-        print_menu("AprilTag Navigation — Main Menu", menu_options)
-        choice = input("Select: ").strip().lower()
-        if choice == '1':
-            run_simulation_demo(motion, duration=20)
-        elif choice == '2':
-            seq = input("Enter tag sequence (comma-separated, e.g. 0,1,2): ").strip()
-            tags = [t.strip() for t in seq.split(',')]
-            navigator.execute_mission(tags)
-        elif choice == 'q':
-            break
+while True:
+    # Button A: toggle pause
+    if button_a.was_pressed():
+        running = not running
+        if not running:
+            tinybit.car_run(0, 0)
+            display.show(Image.NO)
         else:
-            print("Invalid choice.")
-        wait_for_keypress()
+            display.show(Image.TARGET)
 
-    safety.stop()
-    robot_serial.disconnect()
-    print("[EXIT] AprilTag navigation ended.")
+    # Button B: show last tag ID
+    if button_b.was_pressed() and last_tag_id is not None:
+        display.scroll("T" + last_tag_id)
 
+    if not running:
+        sleep(50)
+        continue
 
-if __name__ == "__main__":
-    main()
+    cmd, payload = read_command()
+
+    if cmd == "20":
+        # Motor speed command (PID follow mode)
+        speeds = parse_motor(payload)
+        if speeds:
+            tinybit.car_run(speeds[0], speeds[1])
+
+    elif cmd == "04":
+        # AprilTag detected
+        tag_info = parse_apriltag(payload)
+        if tag_info:
+            tag_id, family = tag_info
+            last_tag_id = tag_id
+            # Show tag ID on LED (1-5 pixels based on ID)
+            try:
+                dots = min(int(tag_id), 25)
+                rows = ["0" * 5 for _ in range(5)]
+                for i in range(dots):
+                    row, col = divmod(i, 5)
+                    r = list(rows[row])
+                    r[col] = '9'
+                    rows[row] = "".join(r)
+                img_str = ":".join(rows)
+                display.show(Image(img_str))
+            except Exception:
+                display.show(Image.YES)
+
+    elif cmd == "#":
+        tinybit.car_run(0, 0)
+
+    sleep(10)

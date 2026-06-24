@@ -1,209 +1,155 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robot QR Code Commander — Visual Command Interpretation
-=========================================================
-The robot reads QR codes / barcodes and executes commands
-encoded in them.
+Robot QR Code Commander — Visual QR/Barcode Command Execution
+===============================================================
+Receives QR code / barcode payloads from K210 and executes
+the commands encoded in them.
 
-Supported QR command formats:
-  - FWD:<speed>:<duration>   — Forward at speed for duration
-  - BACK:<speed>:<duration>  — Backward
-  - LEFT:<speed>:<duration>  — Turn left
-  - RIGHT:<speed>:<duration> — Turn right
-  - STOP                     — Stop
-  - SQUARE:<speed>           — Drive a square
-  - CIRCLE:<speed>           — Drive a circle
-  - SPEED:<value>            — Set default speed
+Works with K210 source: 2.2_3.2_find_barcodes.py or 2.2_3.3_find_qrcodes.py
 
-Target hardware: micro:bit + K210 smart car
-Communication:  Serial (UART)
+Protocol (from K210):
+  $02<payload>,#  — Barcode payload (raw text)
+  $03<payload>,#  — QR code payload (raw text)
+
+Supported QR/Barcode text commands:
+  FWD:<speed>       — Forward at speed
+  BACK:<speed>      — Backward at speed
+  LEFT:<speed>      — Turn left
+  RIGHT:<speed>     — Turn right
+  STOP              — Stop
+  SQUARE            — Drive square pattern
+  CIRCLE            — Drive circle pattern
+  DANCE             — Wiggle dance
+
+Hardware: micro:bit + Tinybit smart car
+Library:  tinybit
 """
 
-import sys
-import time
-from robot_utils import (RobotSerial, RobotMotion, SafetyGuard,
-                         print_banner, print_menu, wait_for_keypress)
+from microbit import display, Image, sleep, uart, button_a
+import tinybit
 
+# --- Configuration ---
+BAUDRATE = 115200
+DEFAULT_SPEED = 80
 
-class QRCommandParser:
-    """Parses QR code payloads into robot commands."""
+# --- Initialize UART ---
+uart.init(baudrate=BAUDRATE)
 
-    @staticmethod
-    def parse(payload):
-        payload = payload.strip().upper()
-        if ':' in payload:
-            parts = payload.split(':')
-            cmd = parts[0]
-            args = parts[1:]
-            if cmd == 'FWD':
-                s = int(args[0]) if len(args) > 0 else 80
-                d = float(args[1]) if len(args) > 1 else 1.0
-                return 'forward', {'speed': s, 'duration': d}
-            elif cmd == 'BACK':
-                s = int(args[0]) if len(args) > 0 else 80
-                d = float(args[1]) if len(args) > 1 else 1.0
-                return 'backward', {'speed': s, 'duration': d}
-            elif cmd == 'LEFT':
-                s = int(args[0]) if len(args) > 0 else 60
-                d = float(args[1]) if len(args) > 1 else 0.35
-                return 'left', {'speed': s, 'duration': d}
-            elif cmd == 'RIGHT':
-                s = int(args[0]) if len(args) > 0 else 60
-                d = float(args[1]) if len(args) > 1 else 0.35
-                return 'right', {'speed': s, 'duration': d}
-            elif cmd == 'SQUARE':
-                s = int(args[0]) if len(args) > 0 else 100
-                return 'square', {'speed': s}
-            elif cmd == 'CIRCLE':
-                s = int(args[0]) if len(args) > 0 else 80
-                return 'circle', {'speed': s}
-            elif cmd == 'ZIGZAG':
-                s = int(args[0]) if len(args) > 0 else 80
-                return 'zigzag', {'speed': s}
-            elif cmd == 'SPEED':
-                s = int(args[0]) if len(args) > 0 else 80
-                return 'set_speed', {'speed': s}
-        if payload == 'STOP':
-            return 'stop', {}
-        return 'unknown', {'raw': payload}
-
-
-class QRCommandExecutor:
-    """Executes commands decoded from QR codes."""
-
-    def __init__(self, motion):
-        self.motion = motion
-        self.default_speed = 80
-        self.command_history = []
-
-    def execute(self, command_type, params):
-        self.command_history.append((command_type, params))
-        print(f"[CMD] {command_type}: {params}")
-
-        if command_type == 'forward':
-            s = params.get('speed', self.default_speed)
-            d = params.get('duration', 1.0)
-            self.motion.move(self.motion.FORWARD, s, d)
-        elif command_type == 'backward':
-            s = params.get('speed', self.default_speed)
-            d = params.get('duration', 1.0)
-            self.motion.move(self.motion.BACKWARD, s, d)
-        elif command_type == 'left':
-            s = params.get('speed', 60)
-            d = params.get('duration', 0.35)
-            self.motion.move(self.motion.LEFT, s, d)
-        elif command_type == 'right':
-            s = params.get('speed', 60)
-            d = params.get('duration', 0.35)
-            self.motion.move(self.motion.RIGHT, s, d)
-        elif command_type == 'stop':
-            self.motion.stop()
-        elif command_type == 'square':
-            s = params.get('speed', self.default_speed)
-            self._exec_square(s)
-        elif command_type == 'circle':
-            s = params.get('speed', 80)
-            self._exec_circle(s)
-        elif command_type == 'zigzag':
-            s = params.get('speed', 80)
-            self._exec_zigzag(s)
-        elif command_type == 'set_speed':
-            self.default_speed = params.get('speed', 80)
-            print(f"  Default speed set to {self.default_speed}")
-        elif command_type == 'unknown':
-            print(f"  [UNKNOWN] Cannot interpret: {params.get('raw', '')}")
-
-    def _exec_square(self, speed):
-        turn = 0.35
-        for _ in range(4):
-            self.motion.move(self.motion.FORWARD, speed, 1.5)
-            self.motion.move(self.motion.RIGHT, speed, turn)
-
-    def _exec_circle(self, speed):
-        self.motion.steer(speed, 0.3)
-        time.sleep(6.0)
-        self.motion.stop()
-
-    def _exec_zigzag(self, speed):
-        turn = 0.35
-        for i in range(3):
-            self.motion.move(self.motion.FORWARD, speed, 1.2)
-            if i % 2 == 0:
-                self.motion.move(self.motion.RIGHT, speed, turn)
+# --- Helpers ---
+def read_command():
+    buf = ""
+    while uart.any():
+        b = uart.read(1)
+        if b is None:
+            continue
+        ch = chr(b[0])
+        if ch == '$':
+            buf = '$'
+        elif buf.startswith('$'):
+            if ch == '#':
+                inner = buf[1:]
+                if len(inner) >= 2:
+                    return inner[0:2], inner[2:]
+                return None, None
             else:
-                self.motion.move(self.motion.LEFT, speed, turn)
+                buf += ch
+    return None, None
 
+def execute_qr_command(text):
+    """Parse and execute a QR/barcode text command."""
+    text = text.strip().upper()
+    parts = text.split(':')
 
-def run_simulation_demo(motion):
-    print_banner("Simulated QR Code Commander Demo")
-    qr_codes = [
-        "FWD:100:2.0", "STOP", "RIGHT:60:0.5", "FWD:80:1.5",
-        "STOP", "LEFT:60:0.5", "SQUARE:90", "CIRCLE:70", "STOP",
-    ]
-    executor = QRCommandExecutor(motion)
-    for i, qr_text in enumerate(qr_codes):
-        print(f"\n--- Scanning QR code #{i+1} ---")
-        print(f"  QR Content: \"{qr_text}\"")
-        cmd_type, params = QRCommandParser.parse(qr_text)
-        executor.execute(cmd_type, params)
-        time.sleep(1.5)
-    print("\n[DONE] All QR commands executed.")
-
-
-def run_interactive_mode(motion):
-    print_banner("Interactive QR Commander")
-    print("Type QR code payload strings to simulate scanning.")
-    print("  FWD:<speed>:<duration>   BACK:<speed>:<duration>")
-    print("  LEFT:<speed>:<duration>  RIGHT:<speed>:<duration>")
-    print("  STOP   SQUARE:<speed>    CIRCLE:<speed>")
-    print("  'quit' to exit.\n")
-    executor = QRCommandExecutor(motion)
-    while True:
+    cmd = parts[0]
+    speed = DEFAULT_SPEED
+    if len(parts) > 1:
         try:
-            qr_text = input("QR> ").strip()
-            if not qr_text:
-                continue
-            if qr_text.lower() in ('quit', 'exit', 'q'):
-                break
-            cmd_type, params = QRCommandParser.parse(qr_text)
-            executor.execute(cmd_type, params)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"[ERROR] {e}")
-    motion.stop()
+            speed = int(parts[1])
+        except ValueError:
+            speed = DEFAULT_SPEED
+
+    if cmd == "FWD" or cmd == "FORWARD":
+        tinybit.car_run(speed, speed)
+        display.show(Image.ARROW_N)
+        sleep(1500)
+
+    elif cmd == "BACK" or cmd == "BACKWARD":
+        tinybit.car_run(-speed, -speed)
+        display.show(Image.ARROW_S)
+        sleep(1500)
+
+    elif cmd == "LEFT":
+        tinybit.car_run(-speed, speed)
+        display.show(Image.ARROW_W)
+        sleep(600)
+
+    elif cmd == "RIGHT":
+        tinybit.car_run(speed, -speed)
+        display.show(Image.ARROW_E)
+        sleep(600)
+
+    elif cmd == "STOP":
+        tinybit.car_run(0, 0)
+        display.show(Image.NO)
+
+    elif cmd == "SQUARE":
+        for _ in range(4):
+            tinybit.car_run(speed, speed)
+            sleep(1500)
+            tinybit.car_run(speed, -speed)
+            sleep(350)
+        tinybit.car_run(0, 0)
+
+    elif cmd == "CIRCLE":
+        for _ in range(20):
+            tinybit.car_run(speed, speed // 2)
+            sleep(150)
+        tinybit.car_run(0, 0)
+
+    elif cmd == "DANCE":
+        for _ in range(3):
+            tinybit.car_run(-speed, speed)
+            sleep(300)
+            tinybit.car_run(speed, -speed)
+            sleep(300)
+        tinybit.car_run(0, 0)
+
+    else:
+        # Unknown command — scroll it on LED
+        display.scroll(text[:10])
+        tinybit.car_run(0, 0)
+
+    tinybit.car_run(0, 0)
 
 
-def main():
-    print_banner("Robot QR Code Commander — Visual Command Interpretation")
-    robot_serial = RobotSerial()
-    motion = RobotMotion(robot_serial, min_speed=15, max_speed=200)
-    safety = SafetyGuard(motion, max_run_time=300)
-    safety.start()
+# --- Main loop ---
+display.show(Image.HAPPY)
+running = True
 
-    menu_options = [
-        ('1', 'Run simulation demo (pre-recorded QR codes)'),
-        ('2', 'Interactive mode (type QR payloads manually)'),
-        ('q', 'Quit'),
-    ]
-    while True:
-        print_menu("QR Code Commander — Main Menu", menu_options)
-        choice = input("Select: ").strip().lower()
-        if choice == '1':
-            run_simulation_demo(motion)
-        elif choice == '2':
-            run_interactive_mode(motion)
-        elif choice == 'q':
-            break
+while True:
+    if button_a.was_pressed():
+        running = not running
+        if not running:
+            tinybit.car_run(0, 0)
+            display.show(Image.NO)
         else:
-            print("Invalid choice.")
-        wait_for_keypress()
+            display.show(Image.HAPPY)
 
-    safety.stop()
-    robot_serial.disconnect()
-    print("[EXIT] QR Code commander ended.")
+    if not running:
+        sleep(50)
+        continue
 
+    cmd, payload = read_command()
 
-if __name__ == "__main__":
-    main()
+    if cmd == "02" or cmd == "03":
+        # Barcode or QR code detected
+        text = payload.strip().rstrip(',')
+        if text:
+            display.show(Image.YES)
+            sleep(100)
+            execute_qr_command(text)
+
+    elif cmd == "#":
+        tinybit.car_run(0, 0)
+
+    sleep(20)

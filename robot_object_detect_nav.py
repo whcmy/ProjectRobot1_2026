@@ -1,143 +1,172 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robot Object Detection Navigation — Vision-Based Scene Understanding
-======================================================================
-Uses the K210's YOLO object detection to recognise objects
-in the environment and navigate accordingly.
+Robot Object Detection Navigation — Vision-Based Scene Response
+=================================================================
+Receives VOC20 object detection results from K210 and navigates
+based on identified objects.
 
-Detected Object Behaviours:
-  - Person          -> Stop and wait
-  - Car / Bus       -> Avoid (turn away)
-  - Bicycle / Bike  -> Follow
-  - Cat / Dog       -> Approach slowly
-  - Traffic signs   -> Obey (stop, turn, speed change)
+Works with K210 source: 2.5_3.4_voc20_object_detect.py
 
-Target hardware: micro:bit + K210 smart car
-Communication:  Serial (UART)
+Protocol (from K210): $09<id>,#
+  id = 0-19  (VOC20 class index)
+
+VOC20 Classes & Robot Behaviors:
+  0: aeroplane    → Ignore
+  1: bicycle      → Follow slowly
+  2: bird         → Stop & wait
+  3: boat         → Ignore
+  4: bottle       → Push forward
+  5: bus          → Avoid (turn right)
+  6: car          → Avoid (turn left)
+  7: cat          → Approach slowly
+  8: chair        → Avoid (turn right)
+  9: cow          → Stop & wait
+  10: diningtable → Avoid (turn right)
+  11: dog         → Approach slowly
+  12: horse       → Stop & wait
+  13: motorbike   → Follow
+  14: person      → Stop & wait
+  15: pottedplant → Avoid
+  16: sheep       → Stop & wait
+  17: sofa        → Avoid
+  18: train       → Stop & wait
+  19: tvmonitor   → Ignore
+
+Hardware: micro:bit + Tinybit smart car
+Library:  tinybit
 """
 
-import sys
-import time
-from robot_utils import (RobotSerial, RobotMotion, SafetyGuard,
-                         print_banner, print_menu, wait_for_keypress)
+from microbit import display, Image, sleep, uart, button_a
+import tinybit
 
+# --- Configuration ---
+BAUDRATE = 115200
+DEFAULT_SPEED = 60
 
-class ObjectDetectionNavigator:
-    """Navigates based on detected objects in the camera frame."""
+# VOC20 class index → (label, behavior)
+VOC_BEHAVIORS = {
+    0:  ("aeroplane", "ignore"),
+    1:  ("bicycle", "follow"),
+    2:  ("bird", "stop_wait"),
+    3:  ("boat", "ignore"),
+    4:  ("bottle", "push"),
+    5:  ("bus", "avoid_right"),
+    6:  ("car", "avoid_left"),
+    7:  ("cat", "approach_slow"),
+    8:  ("chair", "avoid_right"),
+    9:  ("cow", "stop_wait"),
+    10: ("diningtable", "avoid_right"),
+    11: ("dog", "approach_slow"),
+    12: ("horse", "stop_wait"),
+    13: ("motorbike", "follow"),
+    14: ("person", "stop_wait"),
+    15: ("pottedplant", "avoid_right"),
+    16: ("sheep", "stop_wait"),
+    17: ("sofa", "avoid_left"),
+    18: ("train", "stop_wait"),
+    19: ("tvmonitor", "ignore"),
+}
 
-    VOC_LABELS = [
-        "aeroplane", "bicycle", "bird", "boat", "bottle",
-        "bus", "car", "cat", "chair", "cow",
-        "diningtable", "dog", "horse", "motorbike", "person",
-        "pottedplant", "sheep", "sofa", "train", "tvmonitor"
-    ]
+# --- Initialize UART ---
+uart.init(baudrate=BAUDRATE)
 
-    VOC_BEHAVIOURS = {
-        "person": "stop_wait", "bicycle": "follow", "car": "avoid_right",
-        "motorbike": "follow", "bus": "avoid_left", "train": "stop_wait",
-        "cat": "approach_slow", "dog": "approach_slow",
-        "chair": "avoid_right", "sofa": "avoid_left",
-        "bottle": "push", "cow": "stop_wait", "horse": "stop_wait",
-        "sheep": "stop_wait", "diningtable": "avoid_right",
-        "pottedplant": "avoid_right",
-    }
+# --- Helpers ---
+def read_command():
+    buf = ""
+    while uart.any():
+        b = uart.read(1)
+        if b is None:
+            continue
+        ch = chr(b[0])
+        if ch == '$':
+            buf = '$'
+        elif buf.startswith('$'):
+            if ch == '#':
+                inner = buf[1:]
+                if len(inner) >= 2:
+                    return inner[0:2], inner[2:]
+                return None, None
+            else:
+                buf += ch
+    return None, None
 
-    def __init__(self, motion):
-        self.motion = motion
-        self.current_object = None
-        self.detection_count = {}
-        self.default_speed = 80
+def execute_behavior(behavior):
+    """Execute robot behavior based on detected object."""
+    if behavior == "ignore":
+        pass  # keep current state
 
-    def handle_detection(self, object_label):
-        self.detection_count[object_label] = self.detection_count.get(object_label, 0) + 1
-        self.current_object = object_label
-        behaviour = self.VOC_BEHAVIOURS.get(object_label, "ignore")
-        print(f"[DETECT] {object_label:>15s} -> {behaviour}")
-        self._execute_behaviour(behaviour)
+    elif behavior == "stop_wait":
+        tinybit.car_run(0, 0)
+        display.show(Image.NO)
+        sleep(1500)
 
-    def _execute_behaviour(self, behaviour):
-        if behaviour == "stop_wait":
-            self.motion.stop()
-            time.sleep(1.5)
-        elif behaviour == "forward":
-            self.motion.forward(self.default_speed)
-        elif behaviour == "avoid_right":
-            self.motion.turn_right(60)
-            time.sleep(0.5)
-            self.motion.forward(self.default_speed)
-            time.sleep(1.0)
-            self.motion.turn_left(60)
-            time.sleep(0.5)
-        elif behaviour == "avoid_left":
-            self.motion.turn_left(60)
-            time.sleep(0.5)
-            self.motion.forward(self.default_speed)
-            time.sleep(1.0)
-            self.motion.turn_right(60)
-            time.sleep(0.5)
-        elif behaviour == "follow":
-            self.motion.forward(int(self.default_speed * 0.7))
-        elif behaviour == "approach_slow":
-            self.motion.forward(40)
-        elif behaviour == "push":
-            self.motion.forward(50)
-            time.sleep(1.0)
-            self.motion.stop()
+    elif behavior == "follow":
+        tinybit.car_run(DEFAULT_SPEED, DEFAULT_SPEED)
+        display.show(Image.ARROW_N)
 
-    def show_stats(self):
-        if not self.detection_count:
-            print("No objects detected yet.")
-            return
-        print("\nDetection Statistics:")
-        for obj, count in sorted(self.detection_count.items(), key=lambda x: x[1], reverse=True):
-            bar = '#' * min(count, 30)
-            print(f"  {obj:>15s}: {count:3d} {bar}")
+    elif behavior == "approach_slow":
+        tinybit.car_run(DEFAULT_SPEED // 2, DEFAULT_SPEED // 2)
+        display.show(Image.ARROW_N)
+        sleep(2000)
+        tinybit.car_run(0, 0)
 
+    elif behavior == "avoid_right":
+        tinybit.car_run(DEFAULT_SPEED, -DEFAULT_SPEED)
+        display.show(Image.ARROW_E)
+        sleep(500)
+        tinybit.car_run(DEFAULT_SPEED, DEFAULT_SPEED)
+        sleep(1000)
+        tinybit.car_run(-DEFAULT_SPEED, DEFAULT_SPEED)
+        sleep(500)
 
-def run_simulation_demo(motion):
-    print_banner("Simulated Object Detection Navigation Demo")
-    navigator = ObjectDetectionNavigator(motion)
-    detections = ["person", "bicycle", "car", "chair", "dog", "bottle", "bus", "cat"]
-    for obj in detections:
-        print(f"\n--- Camera sees: {obj} ---")
-        navigator.handle_detection(obj)
-        time.sleep(2.0)
-    motion.stop()
-    navigator.show_stats()
-    print("\n[DONE] Object detection demo complete.")
+    elif behavior == "avoid_left":
+        tinybit.car_run(-DEFAULT_SPEED, DEFAULT_SPEED)
+        display.show(Image.ARROW_W)
+        sleep(500)
+        tinybit.car_run(DEFAULT_SPEED, DEFAULT_SPEED)
+        sleep(1000)
+        tinybit.car_run(DEFAULT_SPEED, -DEFAULT_SPEED)
+        sleep(500)
 
+    elif behavior == "push":
+        tinybit.car_run(DEFAULT_SPEED, DEFAULT_SPEED)
+        display.show(Image.ARROW_N)
+        sleep(1000)
+        tinybit.car_run(0, 0)
 
-def main():
-    print_banner("Robot Object Detection Navigation — Scene Understanding")
-    robot_serial = RobotSerial()
-    motion = RobotMotion(robot_serial, min_speed=15, max_speed=200)
-    safety = SafetyGuard(motion, max_run_time=300)
-    safety.start()
-    navigator = ObjectDetectionNavigator(motion)
+# --- Main loop ---
+display.show(Image.HAPPY)
+running = True
+last_object = None
 
-    menu_options = [
-        ('1', 'VOC object detection simulation demo'),
-        ('2', 'Detection statistics'),
-        ('q', 'Quit'),
-    ]
-    while True:
-        print_menu("Object Detection Nav — Main Menu", menu_options)
-        choice = input("Select: ").strip().lower()
-        if choice == '1':
-            run_simulation_demo(motion)
-        elif choice == '2':
-            navigator.show_stats()
-        elif choice == 'q':
-            break
+while True:
+    if button_a.was_pressed():
+        running = not running
+        if not running:
+            tinybit.car_run(0, 0)
+            display.show(Image.NO)
         else:
-            print("Invalid choice.")
-        wait_for_keypress()
+            display.show(Image.HAPPY)
 
-    safety.stop()
-    robot_serial.disconnect()
-    print("[EXIT] Object detection navigation ended.")
+    if not running:
+        sleep(50)
+        continue
 
+    cmd, payload = read_command()
 
-if __name__ == "__main__":
-    main()
+    if cmd == "09":
+        try:
+            obj_id = int(payload.strip().rstrip(','))
+            if obj_id in VOC_BEHAVIORS:
+                label, behavior = VOC_BEHAVIORS[obj_id]
+                if obj_id != last_object:
+                    last_object = obj_id
+                    display.scroll(label[:5])
+                execute_behavior(behavior)
+        except ValueError:
+            pass
+
+    elif cmd == "#":
+        tinybit.car_run(0, 0)
+
+    sleep(20)

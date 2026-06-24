@@ -1,224 +1,211 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robot Voice Command — Natural Language Interface
-==================================================
-Provides a natural-language command interface for robot control.
-Type commands in plain English and the robot executes them.
+Robot Voice Command — Serial Text Command Interface
+=====================================================
+Receives text commands via serial (from K210 or another
+module with speech recognition) and executes them.
 
-Supported Commands:
-  - "go forward" / "move ahead" / "forward"
-  - "go back" / "backward" / "reverse"
-  - "turn left" / "go left" / "left"
-  - "turn right" / "go right" / "right"
-  - "stop" / "halt" / "freeze"
-  - "faster" / "speed up"
-  - "slower" / "slow down"
-  - "dance" / "celebrate"
-  - "square" / "circle" / "zigzag"
-  - "patrol" / "autonomous"
+The K210 sends recognized speech as text over serial.
+micro:bit parses the command and controls the robot.
 
-Target hardware: micro:bit + K210 smart car
-Communication:  Serial (UART)
+Protocol (from K210 — voice recognition module):
+  Raw text strings over serial (no $ prefix for voice data)
+
+Command vocabulary:
+  forward / go          — Forward
+  backward / back       — Backward
+  left / turn left      — Turn left
+  right / turn right    — Turn right
+  stop / halt           — Stop
+  faster                — Increase speed
+  slower                — Decrease speed
+  dance                 — Wiggle dance
+  square                — Drive square path
+  circle                — Drive circle path
+
+Also accepts standard protocol: $20+LxxxRxxx,#
+
+Hardware: micro:bit + Tinybit smart car
+Library:  tinybit
 """
 
-import sys
-import time
-import random
-from robot_utils import (RobotSerial, RobotMotion, SafetyGuard,
-                         print_banner, print_menu, wait_for_keypress)
+from microbit import display, Image, sleep, uart, button_a, button_b
+import tinybit
 
+# --- Configuration ---
+BAUDRATE = 115200
+DEFAULT_SPEED = 80
 
-class CommandVocabulary:
-    """Natural-language command vocabulary with fuzzy matching."""
+# --- Voice command vocabulary ---
+VOICE_COMMANDS = {
+    "forward":  "forward",
+    "go":       "forward",
+    "ahead":    "forward",
+    "backward": "backward",
+    "back":     "backward",
+    "reverse":  "backward",
+    "left":     "turn_left",
+    "right":    "turn_right",
+    "stop":     "stop",
+    "halt":     "stop",
+    "faster":   "faster",
+    "speed up": "faster",
+    "slower":   "slower",
+    "slow down":"slower",
+    "dance":    "dance",
+    "square":   "square",
+    "circle":   "circle",
+}
 
-    VOCABULARY = {
-        "forward": ("forward", {"speed": 80, "duration": 2.0}),
-        "go forward": ("forward", {"speed": 80, "duration": 2.0}),
-        "move ahead": ("forward", {"speed": 80, "duration": 2.0}),
-        "go straight": ("forward", {"speed": 80, "duration": 2.0}),
-        "backward": ("backward", {"speed": 60, "duration": 1.5}),
-        "go back": ("backward", {"speed": 60, "duration": 1.5}),
-        "reverse": ("backward", {"speed": 60, "duration": 1.5}),
-        "left": ("turn_left", {"speed": 60, "duration": 0.35}),
-        "turn left": ("turn_left", {"speed": 60, "duration": 0.5}),
-        "go left": ("turn_left", {"speed": 60, "duration": 0.35}),
-        "right": ("turn_right", {"speed": 60, "duration": 0.35}),
-        "turn right": ("turn_right", {"speed": 60, "duration": 0.5}),
-        "go right": ("turn_right", {"speed": 60, "duration": 0.35}),
-        "stop": ("stop", {}),
-        "halt": ("stop", {}),
-        "freeze": ("stop", {}),
-        "faster": ("speed_up", {}),
-        "speed up": ("speed_up", {}),
-        "slower": ("speed_down", {}),
-        "slow down": ("speed_down", {}),
-        "slow": ("set_speed", {"speed": 40}),
-        "medium": ("set_speed", {"speed": 80}),
-        "fast": ("set_speed", {"speed": 120}),
-        "square": ("square", {}),
-        "circle": ("circle", {}),
-        "zigzag": ("zigzag", {}),
-        "dance": ("dance", {}),
-        "celebrate": ("dance", {}),
-        "patrol": ("patrol", {}),
-        "autonomous": ("autonomous", {}),
-        "status": ("status", {}),
-        "help": ("help", {}),
-    }
+# --- Initialize UART ---
+uart.init(baudrate=BAUDRATE)
 
-    @classmethod
-    def match(cls, text):
-        text = text.strip().lower()
-        if text in cls.VOCABULARY:
-            return cls.VOCABULARY[text]
-        for keyword, action in cls.VOCABULARY.items():
-            if keyword in text:
-                return action
-        return ('unknown', {"raw": text})
+# --- Helpers ---
+def read_all_serial():
+    """Read all available serial data as string."""
+    data = ""
+    while uart.any():
+        b = uart.read(1)
+        if b:
+            try:
+                data += chr(b[0])
+            except Exception:
+                pass
+    return data
 
-    @classmethod
-    def list_commands(cls):
-        print("\nAvailable Voice Commands:")
-        cats = {
-            "Movement": ["forward", "backward", "left", "right", "stop"],
-            "Speed": ["faster", "slower", "slow", "medium", "fast"],
-            "Paths": ["square", "circle", "zigzag"],
-            "Special": ["dance", "patrol", "autonomous"],
-        }
-        for cat, keywords in cats.items():
-            print(f"\n  {cat}:")
-            for kw in keywords:
-                action, _ = cls.VOCABULARY[kw]
-                print(f'    "{kw}" -> {action}')
-
-
-class VoiceCommandExecutor:
-    """Executes parsed voice commands on the robot."""
-
-    def __init__(self, motion):
-        self.motion = motion
-        self.default_speed = 80
-
-    def execute(self, action_type, params):
-        print(f"[VOICE] -> {action_type} {params}")
-        if action_type == 'forward':
-            s = params.get('speed', self.default_speed)
-            d = params.get('duration', 2.0)
-            self.motion.move(self.motion.FORWARD, s, d)
-        elif action_type == 'backward':
-            s = params.get('speed', 60)
-            d = params.get('duration', 1.5)
-            self.motion.move(self.motion.BACKWARD, s, d)
-        elif action_type == 'turn_left':
-            s = params.get('speed', 60)
-            d = params.get('duration', 0.5)
-            self.motion.move(self.motion.LEFT, s, d)
-        elif action_type == 'turn_right':
-            s = params.get('speed', 60)
-            d = params.get('duration', 0.5)
-            self.motion.move(self.motion.RIGHT, s, d)
-        elif action_type == 'stop':
-            self.motion.stop()
-        elif action_type == 'speed_up':
-            self.default_speed = min(150, self.default_speed + 20)
-            print(f"  Speed: {self.default_speed}")
-        elif action_type == 'speed_down':
-            self.default_speed = max(20, self.default_speed - 20)
-            print(f"  Speed: {self.default_speed}")
-        elif action_type == 'set_speed':
-            self.default_speed = params.get('speed', 80)
-            print(f"  Speed set to: {self.default_speed}")
-        elif action_type == 'dance':
-            print("  Dancing!")
-            for _ in range(3):
-                self.motion.turn_left(80)
-                time.sleep(0.3)
-                self.motion.turn_right(80)
-                time.sleep(0.3)
-            self.motion.stop()
-        elif action_type == 'square':
-            turn = 0.35
-            for _ in range(4):
-                self.motion.move(self.motion.FORWARD, self.default_speed, 1.5)
-                self.motion.move(self.motion.RIGHT, 60, turn)
-        elif action_type == 'circle':
-            self.motion.steer(self.default_speed, 0.3)
-            time.sleep(6.0)
-            self.motion.stop()
-        elif action_type == 'zigzag':
-            turn = 0.35
-            for i in range(4):
-                self.motion.move(self.motion.FORWARD, self.default_speed, 1.0)
-                if i % 2 == 0:
-                    self.motion.move(self.motion.RIGHT, 60, turn)
-                else:
-                    self.motion.move(self.motion.LEFT, 60, turn)
-        elif action_type == 'patrol':
-            for i in range(6):
-                self.motion.move(self.motion.FORWARD, 80, 1.5)
-                if i % 2 == 0:
-                    self.motion.move(self.motion.RIGHT, 60, 0.35)
-                else:
-                    self.motion.move(self.motion.LEFT, 60, 0.35)
-            self.motion.stop()
-        elif action_type == 'autonomous':
-            print("  Auto mode: moving randomly for 8 seconds")
-            for _ in range(8):
-                r = random.random()
-                if r < 0.5:
-                    self.motion.forward(60)
-                elif r < 0.75:
-                    self.motion.turn_left(60)
-                else:
-                    self.motion.turn_right(60)
-                time.sleep(1.0)
-            self.motion.stop()
-        elif action_type == 'status':
-            print(f"  Speed: {self.default_speed}")
-        elif action_type == 'help':
-            CommandVocabulary.list_commands()
-        elif action_type == 'unknown':
-            print(f'  [UNKNOWN] Command not recognised: "{params.get("raw", "")}"')
-            print("  Say 'help' to see available commands.")
-
-
-def main():
-    print_banner("Robot Voice Command — Natural Language Interface")
-    robot_serial = RobotSerial()
-    motion = RobotMotion(robot_serial, min_speed=15, max_speed=200)
-    safety = SafetyGuard(motion, max_run_time=600)
-    safety.start()
-    executor = VoiceCommandExecutor(motion)
-
-    print("""
-  +--------------------------------------------------+
-  |        Voice Command Interface (Text Mode)       |
-  +--------------------------------------------------+
-  |  Type a command and press Enter.                 |
-  |  Type 'help' to see all available commands.      |
-  |  Type 'quit' to exit.                            |
-  +--------------------------------------------------+
-""")
-    while True:
-        try:
-            cmd = input("Voice> ").strip()
-            if not cmd:
+def parse_protocol(data):
+    """Try to parse $<cmd><payload>,# protocol from data.
+    Returns list of (cmd, payload) tuples."""
+    results = []
+    i = 0
+    while i < len(data):
+        if data[i] == '$':
+            end = data.find('#', i)
+            if end != -1:
+                inner = data[i+1:end]
+                if len(inner) >= 2:
+                    results.append((inner[0:2], inner[2:]))
+                i = end + 1
                 continue
-            if cmd.lower() in ('quit', 'exit', 'q'):
-                break
-            action_type, params = CommandVocabulary.match(cmd)
-            executor.execute(action_type, params)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"[ERROR] {e}")
+        i += 1
+    return results
 
-    motion.stop()
-    safety.stop()
-    robot_serial.disconnect()
-    print("[EXIT] Voice command interface ended.")
+def match_voice_command(text):
+    """Match text against voice command vocabulary."""
+    text = text.lower().strip()
+    # Direct match
+    if text in VOICE_COMMANDS:
+        return VOICE_COMMANDS[text]
+    # Substring match
+    for keyword, cmd in VOICE_COMMANDS.items():
+        if keyword in text:
+            return cmd
+    return None
+
+def execute_command(cmd, speed=DEFAULT_SPEED):
+    """Execute a parsed command on the robot."""
+    if cmd == "forward":
+        tinybit.car_run(speed, speed)
+        display.show(Image.ARROW_N)
+        sleep(1500)
+
+    elif cmd == "backward":
+        tinybit.car_run(-speed, -speed)
+        display.show(Image.ARROW_S)
+        sleep(1500)
+
+    elif cmd == "turn_left":
+        tinybit.car_run(-speed, speed)
+        display.show(Image.ARROW_W)
+        sleep(500)
+
+    elif cmd == "turn_right":
+        tinybit.car_run(speed, -speed)
+        display.show(Image.ARROW_E)
+        sleep(500)
+
+    elif cmd == "stop":
+        tinybit.car_run(0, 0)
+        display.show(Image.NO)
+
+    elif cmd == "faster":
+        # Speed handled in main loop via current_speed variable
+        pass
+
+    elif cmd == "slower":
+        # Speed handled in main loop via current_speed variable
+        pass
+
+    elif cmd == "dance":
+        for _ in range(3):
+            tinybit.car_run(-speed, speed)
+            sleep(300)
+            tinybit.car_run(speed, -speed)
+            sleep(300)
+
+    elif cmd == "square":
+        for _ in range(4):
+            tinybit.car_run(speed, speed)
+            sleep(1500)
+            tinybit.car_run(speed, -speed)
+            sleep(350)
+
+    elif cmd == "circle":
+        for _ in range(30):
+            tinybit.car_run(speed, speed // 3)
+            sleep(150)
+
+    tinybit.car_run(0, 0)
 
 
-if __name__ == "__main__":
-    main()
+# --- Main loop ---
+display.show(Image.HEART)
+running = True
+current_speed = DEFAULT_SPEED
+
+while True:
+    # Button A: toggle pause
+    if button_a.was_pressed():
+        running = not running
+        if not running:
+            tinybit.car_run(0, 0)
+            display.show(Image.NO)
+        else:
+            display.show(Image.HEART)
+
+    if not running:
+        sleep(50)
+        continue
+
+    # Read all serial data
+    ser_data = read_all_serial()
+
+    if ser_data:
+        # Try protocol parsing first ($20+LxxxRxxx,#)
+        commands = parse_protocol(ser_data)
+
+        if commands:
+            for cmd, payload in commands:
+                if cmd == "20":
+                    try:
+                        p = payload.strip().rstrip(',')
+                        if len(p) >= 8:
+                            tinybit.car_run(int(p[0:4]), int(p[4:8]))
+                    except (ValueError, IndexError):
+                        pass
+                elif cmd == "#":
+                    tinybit.car_run(0, 0)
+        else:
+            # Try voice command matching
+            voice_cmd = match_voice_command(ser_data)
+            if voice_cmd:
+                if voice_cmd == "faster":
+                    current_speed = min(200, current_speed + 20)
+                    display.scroll("S" + str(current_speed // 10))
+                elif voice_cmd == "slower":
+                    current_speed = max(20, current_speed - 20)
+                    display.scroll("S" + str(current_speed // 10))
+                else:
+                    execute_command(voice_cmd, current_speed)
+
+    sleep(30)
