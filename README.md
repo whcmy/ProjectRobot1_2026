@@ -37,7 +37,7 @@ What are the functions of these Python files?
 
 How to configure the HEX file?
 
-Click here [Hex烧录参考手册（PDF）](./docs/Hex_Flashing_Guide.pdf) I have summarized all scenarios.
+Click here [Hex_Flashing_Guide（PDF）](./docs/Hex_Flashing_Guide.pdf) I have summarized all scenarios.
 
 How to run the code?
 
